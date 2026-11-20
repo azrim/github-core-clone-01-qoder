@@ -36,8 +36,10 @@ Go lives at `D:\opt\go\bin\go.exe` (also on PATH as `go` in a fresh shell). Buil
     # local-test binary: Windows, never committed (in .gitignore)
     go build -trimpath -ldflags "-s -w" -o forge.exe ./cmd/forge
 
-`main.ts` selects the binary by platform: on `win32` it spawns `./forge.exe`, otherwise `./forge`.
-Both come from the same Go source, so the Windows build is a faithful test proxy. If the spawned
+`main.ts` selects the binary by platform: on `win32` it spawns `./forge.exe`, otherwise `./forge`,
+resolving the path from `import.meta.dirname`, never from `process.cwd()` (the local process
+driver imports `main.ts` from its own launcher, so the cwd is not the repository). Both binaries
+come from the same Go source, so the Windows build is a faithful test proxy. If the spawned
 binary is missing it must fail loudly with the spawn error on stderr — never silently pass.
 
 A pure Node 22 implementation is the fallback only if Go cannot build. Do not use any third-party
