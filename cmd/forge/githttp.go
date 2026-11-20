@@ -181,6 +181,7 @@ func (s *Server) handleUploadV2(w http.ResponseWriter, repo *Repo, segments [][]
 	}
 	command := ""
 	for _, line := range header {
+		line = strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(line, "command=") {
 			command = strings.TrimPrefix(line, "command=")
 		}
@@ -238,6 +239,7 @@ func (s *Server) writeLsRefsLocked(buf *bytes.Buffer, repo *Repo, args []string)
 	unborn := false
 	var prefixes []string
 	for _, line := range args {
+		line = strings.TrimRight(line, "\r\n")
 		switch {
 		case line == "peel":
 			peel = true
@@ -295,6 +297,7 @@ func (s *Server) fetchFor(repo *Repo, args []string) fetchPack {
 	var wants, haves, shallow []string
 	depth := 0
 	for _, line := range args {
+		line = strings.TrimRight(line, "\r\n")
 		switch {
 		case strings.HasPrefix(line, "want "):
 			fields := strings.Fields(line)
@@ -336,6 +339,9 @@ func (s *Server) fetchFor(repo *Repo, args []string) fetchPack {
 		set, bounds = wantClosure(repo, wants, depth)
 	}
 	haveSet := closureOf(repo, haves)
+	if len(shallow) > 0 {
+		haveSet = closureOfShallow(repo, haves, shallow)
+	}
 	oids := make([]string, 0, len(set))
 	for oid := range set {
 		if haveSet[oid] {

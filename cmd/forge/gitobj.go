@@ -397,6 +397,53 @@ func treeClosureOf(repo *Repo, treeOID string, into map[string]bool) {
 	}
 }
 
+// closureOfShallow is closureOf with a shallow boundary: a commit named in `shallow` contributes
+// its own tree but none of its parents, so a fetch starting from a shallow tip does not treat the
+// cut-off history as held.
+func closureOfShallow(repo *Repo, roots, shallow []string) map[string]bool {
+	boundary := make(map[string]bool, len(shallow))
+	for _, oid := range shallow {
+		boundary[oid] = true
+	}
+	seen := make(map[string]bool)
+	var visit func(oid string)
+	visit = func(oid string) {
+		if oid == "" || seen[oid] {
+			return
+		}
+		seen[oid] = true
+		obj := repo.Objects[oid]
+		if obj == nil {
+			return
+		}
+		switch obj.typ {
+		case "commit":
+			c := parseCommit(obj.data)
+			visit(c.tree)
+			if !boundary[oid] {
+				for _, p := range c.parents {
+					visit(p)
+				}
+			}
+		case "tree":
+			entries, err := parseTree(obj.data)
+			if err != nil {
+				return
+			}
+			for _, e := range entries {
+				visit(e.oid)
+			}
+		case "tag":
+			target, _ := parseTag(obj.data)
+			visit(target)
+		}
+	}
+	for _, r := range roots {
+		visit(r)
+	}
+	return seen
+}
+
 // wantClosure is the object set a fetch of wants at a given depth must deliver. It also returns
 // the shallow boundary commits (commits whose parents are cut off by the depth limit).
 func wantClosure(repo *Repo, wants []string, depth int) (map[string]bool, []string) {
@@ -593,9 +640,17 @@ func diffTreePaths(repo *Repo, a, b string) []string {
 			path := prefix + name
 			switch {
 			case !okA:
-				out = append(out, path)
+				if y.mode == "40000" {
+					walk("", y.oid, path+"/")
+				} else {
+					out = append(out, path)
+				}
 			case !okB:
-				out = append(out, path)
+				if x.mode == "40000" {
+					walk(x.oid, "", path+"/")
+				} else {
+					out = append(out, path)
+				}
 			case x.oid == y.oid:
 				continue
 			case x.mode == "40000" && y.mode == "40000":
