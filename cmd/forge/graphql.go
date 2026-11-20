@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -539,7 +538,7 @@ func (s *Server) handleGraphQL(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 401, errBody("Requires authentication"))
 		return
 	}
-	data, err := io.ReadAll(r.Body)
+	data, err := readBody(r)
 	if err != nil {
 		writeJSON(w, 400, map[string]any{"errors": []gqlErr{{Message: "could not read the request body"}}})
 		return
@@ -777,6 +776,7 @@ func (s *Server) gqlField(typ string, obj any, name string, args map[string]any)
 			}
 			is.State = "closed"
 			is.UpdatedAt = s.stampLocked()
+			repo.touchIssues()
 			return gqlObj{"CloseIssuePayload", issuePayload{&issueNode{repo, is}}}, nil
 		case "createPullRequest":
 			kind, id, ok := parseGlobalID(stringFromAny(input["repositoryId"]))
@@ -826,6 +826,7 @@ func (s *Server) gqlField(typ string, obj any, name string, args map[string]any)
 			c := &Comment{ID: s.nextCommentID, Body: stringFromAny(input["body"]), CreatedAt: now}
 			s.nextCommentID++
 			repo.Comments[is.Number] = append(repo.Comments[is.Number], c)
+			repo.touchIssues()
 			return gqlObj{"AddCommentPayload", commentEdge{&commentNode{c}}}, nil
 		}
 		return nil, fmt.Errorf("Cannot query field %q on type %q.", name, typ)

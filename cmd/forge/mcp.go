@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"sort"
 )
@@ -168,7 +167,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 401, errBody("Requires authentication"))
 		return
 	}
-	data, err := io.ReadAll(r.Body)
+	data, err := readBody(r)
 	if err != nil {
 		mcpRPCError(w, 400, nil, -32700, "Parse error")
 		return

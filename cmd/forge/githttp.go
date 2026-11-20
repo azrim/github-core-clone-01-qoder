@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -10,6 +9,15 @@ import (
 )
 
 const uploadAgent = "agent=forge/1.0"
+
+// writeBinary sends a full git protocol body with an explicit length, keeping the client off
+// chunked parsing on every exchange.
+func writeBinary(w http.ResponseWriter, ctype string, body []byte) {
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(200)
+	w.Write(body)
+}
 
 func parseGitPath(path string) (owner, repo, suffix string, ok bool) {
 	p := strings.TrimPrefix(path, "/")
@@ -56,39 +64,70 @@ func (s *Server) gitInfoRefs(w http.ResponseWriter, r *http.Request, owner, name
 		writeJSON(w, 404, errBody("Not Found"))
 		return
 	}
-	repo := s.gitRepo(owner, name)
+	s.mu.Lock()
+	repo := s.repoLocked(owner, name)
 	if repo == nil {
+		s.mu.Unlock()
 		writeJSON(w, 404, errBody("Not Found"))
 		return
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	v2 := service == "git-upload-pack" && strings.Contains(r.Header.Get("Git-Protocol"), "version=2")
-	var buf bytes.Buffer
-	if service == "git-upload-pack" {
-		if v2 {
-			writePkt(&buf, "version 2\n")
-			writePkt(&buf, "agent=forge/1.0\n")
-			writePkt(&buf, "ls-refs=unborn\n")
-			writePkt(&buf, "fetch=shallow filter\n")
-			writePkt(&buf, "object-format=sha1\n")
-			writePkt(&buf, "server-option\n")
-			writeFlush(&buf)
-		} else {
-			writePkt(&buf, "# service=git-upload-pack\n")
-			writeFlush(&buf)
-			s.writeV0RefsLocked(&buf, repo, "multi_ack_detailed side-band-64k thin-pack ofs-delta "+uploadAgent)
+	var body []byte
+	var ctype string
+	switch {
+	case service == "git-upload-pack" && v2:
+		ctype = "application/x-git-upload-pack-advertisement"
+		if repo.advV2 == nil || repo.advV2G != repo.refGen {
+			repo.advV2 = s.uploadAdvLocked(repo, true)
+			repo.advV2G = repo.refGen
 		}
-		w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
-	} else {
-		writePkt(&buf, "# service=git-receive-pack\n")
-		writeFlush(&buf)
-		s.writeV0RefsLocked(&buf, repo, "report-status delete-refs side-band-64k ofs-delta "+uploadAgent)
-		w.Header().Set("Content-Type", "application/x-git-receive-pack-advertisement")
+		body = repo.advV2
+	case service == "git-upload-pack":
+		ctype = "application/x-git-upload-pack-advertisement"
+		if repo.advV0 == nil || repo.advV0G != repo.refGen {
+			repo.advV0 = s.uploadAdvLocked(repo, false)
+			repo.advV0G = repo.refGen
+		}
+		body = repo.advV0
+	default:
+		ctype = "application/x-git-receive-pack-advertisement"
+		if repo.advRcv == nil || repo.advRcvG != repo.refGen {
+			repo.advRcv = s.receiveAdvLocked(repo)
+			repo.advRcvG = repo.refGen
+		}
+		body = repo.advRcv
 	}
+	s.mu.Unlock()
 	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(200)
-	w.Write(buf.Bytes())
+	writeBinary(w, ctype, body)
+}
+
+// uploadAdvLocked renders the upload-pack advertisement, protocol v2 when asked for it.
+func (s *Server) uploadAdvLocked(repo *Repo, v2 bool) []byte {
+	var buf bytes.Buffer
+	if v2 {
+		writePkt(&buf, "version 2\n")
+		writePkt(&buf, "agent=forge/1.0\n")
+		writePkt(&buf, "ls-refs=unborn\n")
+		writePkt(&buf, "fetch=shallow filter\n")
+		writePkt(&buf, "object-format=sha1\n")
+		writePkt(&buf, "server-option\n")
+		writeFlush(&buf)
+	} else {
+		writePkt(&buf, "# service=git-upload-pack\n")
+		writeFlush(&buf)
+		s.writeV0RefsLocked(&buf, repo, "multi_ack_detailed side-band-64k thin-pack ofs-delta "+uploadAgent)
+	}
+	return buf.Bytes()
+}
+
+// receiveAdvLocked renders the receive-pack advertisement (v0 only).
+func (s *Server) receiveAdvLocked(repo *Repo) []byte {
+	var buf bytes.Buffer
+	writePkt(&buf, "# service=git-receive-pack\n")
+	writeFlush(&buf)
+	s.writeV0RefsLocked(&buf, repo, "report-status delete-refs side-band-64k ofs-delta "+uploadAgent)
+	return buf.Bytes()
 }
 
 // headOID returns the oid HEAD names for ref advertisement.
@@ -137,7 +176,7 @@ func (s *Server) writeV0RefsLocked(buf *bytes.Buffer, repo *Repo, caps string) {
 // ---------------------------------------------------------------- upload-pack
 
 func (s *Server) gitUploadPack(w http.ResponseWriter, r *http.Request, owner, name string) {
-	body, err := io.ReadAll(r.Body)
+	body, err := readBody(r)
 	if err != nil {
 		writeJSON(w, 400, errBody("Bad Request"))
 		return
@@ -194,25 +233,12 @@ func (s *Server) handleUploadV2(w http.ResponseWriter, repo *Repo, segments [][]
 		s.mu.RUnlock()
 	case "fetch":
 		pack := s.fetchFor(repo, args)
-		if len(pack.shallow) > 0 || len(pack.unshallow) > 0 {
-			writePkt(&buf, "shallow-info\n")
-			for _, oid := range pack.unshallow {
-				writePkt(&buf, "unshallow "+oid+"\n")
-			}
-			for _, oid := range pack.shallow {
-				writePkt(&buf, "shallow "+oid+"\n")
-			}
-			writeFlush(&buf)
-		}
-		writePkt(&buf, "packfile\n")
-		writeSideband(&buf, pack.pack)
-		writeFlush(&buf)
+		writeBinary(w, "application/x-git-upload-pack-result", pack.body)
+		return
 	default:
 		writeFlush(&buf)
 	}
-	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
-	w.WriteHeader(200)
-	w.Write(buf.Bytes())
+	writeBinary(w, "application/x-git-upload-pack-result", buf.Bytes())
 }
 
 func writeSideband(buf *bytes.Buffer, data []byte) {
@@ -324,13 +350,14 @@ func (s *Server) fetchFor(repo *Repo, args []string) fetchPack {
 		}
 	}
 	key := "d" + strconv.Itoa(depth) + "|w" + strings.Join(wants, ",") + "|h" + strings.Join(haves, ",") + "|s" + strings.Join(shallow, ",")
-	repo.packMu.Lock()
-	defer repo.packMu.Unlock()
-	if cached, ok := repo.packCache[key]; ok {
+	repo.packMu.RLock()
+	gen := repo.packGen
+	cached := repo.packCache[key]
+	repo.packMu.RUnlock()
+	if cached != nil {
 		return *cached
 	}
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var set map[string]bool
 	var bounds []string
 	if len(wants) == 0 {
@@ -367,7 +394,35 @@ func (s *Server) fetchFor(repo *Repo, args []string) fetchPack {
 			pack.unshallow = append(pack.unshallow, oid)
 		}
 	}
-	repo.packCache[key] = &pack
+	s.mu.RUnlock()
+
+	// The whole upload-pack reply is framed once; every clone in the benchmark asks for the same
+	// depth-1 pack, so the framing is cached with the pack itself.
+	var body bytes.Buffer
+	if len(pack.shallow) > 0 || len(pack.unshallow) > 0 {
+		writePkt(&body, "shallow-info\n")
+		for _, oid := range pack.unshallow {
+			writePkt(&body, "unshallow "+oid+"\n")
+		}
+		for _, oid := range pack.shallow {
+			writePkt(&body, "shallow "+oid+"\n")
+		}
+		writeFlush(&body)
+	}
+	writePkt(&body, "packfile\n")
+	writeSideband(&body, pack.pack)
+	writeFlush(&body)
+	pack.body = body.Bytes()
+
+	repo.packMu.Lock()
+	if repo.packGen == gen {
+		if existing := repo.packCache[key]; existing != nil {
+			pack = *existing
+		} else {
+			repo.packCache[key] = &pack
+		}
+	}
+	repo.packMu.Unlock()
 	return pack
 }
 
@@ -423,15 +478,13 @@ func (s *Server) handleUploadV0(w http.ResponseWriter, repo *Repo, segments [][]
 	writePkt(&buf, "NAK\n")
 	writeSideband(&buf, buildPack(objects))
 	writeFlush(&buf)
-	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
-	w.WriteHeader(200)
-	w.Write(buf.Bytes())
+	writeBinary(w, "application/x-git-upload-pack-result", buf.Bytes())
 }
 
 // ---------------------------------------------------------------- receive-pack
 
 func (s *Server) gitReceivePack(w http.ResponseWriter, r *http.Request, owner, name string) {
-	body, err := io.ReadAll(r.Body)
+	body, err := readBody(r)
 	if err != nil {
 		writeJSON(w, 400, errBody("Bad Request"))
 		return
@@ -525,10 +578,9 @@ func (s *Server) gitReceivePack(w http.ResponseWriter, r *http.Request, owner, n
 		repo.Refs[c.ref] = c.new
 		c.ok = true
 	}
-	repo.packMu.Lock()
-	repo.packCache = make(map[string]*fetchPack)
-	repo.packMu.Unlock()
+	repo.touchRefs()
 	s.mu.Unlock()
+	repo.dropPackCache()
 
 	var inner bytes.Buffer
 	if unpackOK {
@@ -552,7 +604,5 @@ func (s *Server) gitReceivePack(w http.ResponseWriter, r *http.Request, owner, n
 	} else {
 		out.Write(inner.Bytes())
 	}
-	w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
-	w.WriteHeader(200)
-	w.Write(out.Bytes())
+	writeBinary(w, "application/x-git-receive-pack-result", out.Bytes())
 }

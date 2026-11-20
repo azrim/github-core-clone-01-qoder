@@ -314,6 +314,7 @@ func (s *Server) handleContents(w http.ResponseWriter, r *http.Request, repo *Re
 		}
 		commit := s.newCommit(repo, newTree, parents, msg)
 		repo.Refs["refs/heads/"+branch] = commit
+		repo.touchRefs()
 		name := parts[len(parts)-1]
 		out := map[string]any{
 			"content": map[string]any{
@@ -379,6 +380,7 @@ func (s *Server) handleContents(w http.ResponseWriter, r *http.Request, repo *Re
 		}
 		commit := s.newCommit(repo, newTree, []string{baseCommit}, msg)
 		repo.Refs["refs/heads/"+branch] = commit
+		repo.touchRefs()
 		s.mu.Unlock()
 		writeJSON(w, 200, map[string]any{"content": nil, "commit": map[string]any{"sha": commit, "message": msg}})
 	default:
@@ -456,6 +458,7 @@ func (s *Server) handleGitAPI(w http.ResponseWriter, r *http.Request, repo *Repo
 				return
 			}
 			repo.Refs[body.Ref] = body.Sha
+			repo.touchRefs()
 			out := s.refJSONLocked(repo, body.Ref)
 			s.mu.Unlock()
 			writeJSON(w, 201, out)
@@ -487,11 +490,13 @@ func (s *Server) handleGitAPI(w http.ResponseWriter, r *http.Request, repo *Repo
 			return
 		}
 		repo.Refs[refName] = body.Sha
+		repo.touchRefs()
 		out := s.refJSONLocked(repo, refName)
 		s.mu.Unlock()
 		writeJSON(w, 200, out)
 	case http.MethodDelete:
 		delete(repo.Refs, refName)
+		repo.touchRefs()
 		s.mu.Unlock()
 		w.WriteHeader(204)
 	default:
@@ -656,6 +661,7 @@ func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request, repo *Repo
 		} else {
 			label.Color = body.Color
 		}
+		repo.touchIssues()
 		out := ghLabel{ID: label.ID, Name: label.Name, Color: label.Color}
 		s.mu.Unlock()
 		writeJSON(w, 201, out)
@@ -706,18 +712,25 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request, repo *Repo
 			})
 			perPage, page := pageBounds(r.URL.Query(), 30)
 			start := (page - 1) * perPage
-			out := make([]ghIssue, 0, len(list))
+			var body []byte
+			body = append(body, '[')
+			first := true
 			if start < len(list) {
 				end := start + perPage
 				if end > len(list) {
 					end = len(list)
 				}
 				for _, is := range list[start:end] {
-					out = append(out, s.issueJSONLocked(repo, is))
+					if !first {
+						body = append(body, ',')
+					}
+					first = false
+					body = append(body, s.issueBytesLocked(repo, is)...)
 				}
 			}
+			body = append(body, ']')
 			s.mu.Unlock()
-			writeJSON(w, 200, out)
+			writeJSONBytes(w, 200, body)
 		case http.MethodPost:
 			var body struct {
 				Title  string   `json:"title"`
@@ -764,9 +777,9 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request, repo *Repo
 	if len(rest) == 1 {
 		switch r.Method {
 		case http.MethodGet:
-			out := s.issueJSONLocked(repo, is)
+			body := s.issueBytesLocked(repo, is)
 			s.mu.Unlock()
-			writeJSON(w, 200, out)
+			writeJSONBytes(w, 200, body)
 		case http.MethodPatch:
 			var body struct {
 				Title *string `json:"title"`
@@ -798,6 +811,7 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request, repo *Repo
 				}
 			}
 			is.UpdatedAt = s.stampLocked()
+			repo.touchIssues()
 			out := s.issueJSONLocked(repo, is)
 			s.mu.Unlock()
 			writeJSON(w, 200, out)
@@ -831,6 +845,7 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request, repo *Repo
 			c := &Comment{ID: s.nextCommentID, Body: body.Body, CreatedAt: now}
 			s.nextCommentID++
 			repo.Comments[number] = append(repo.Comments[number], c)
+			repo.touchIssues()
 			out := ghComment{ID: c.ID, Body: c.Body, User: s.userJSONLocked(), CreatedAt: c.CreatedAt, UpdatedAt: c.CreatedAt}
 			s.mu.Unlock()
 			writeJSON(w, 201, out)
@@ -1030,6 +1045,7 @@ func (s *Server) mergePullLocked(repo *Repo, pr *Pull) (map[string]any, int) {
 	}
 	commit := s.newCommit(repo, headTree, parents, msg)
 	repo.Refs["refs/heads/"+pr.BaseRef] = commit
+	repo.touchRefs()
 	now := s.stampLocked()
 	pr.Merged = true
 	pr.State = "closed"

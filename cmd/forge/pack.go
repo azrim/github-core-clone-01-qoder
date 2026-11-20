@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"sync"
 )
 
 // ---------------------------------------------------------------- pkt-line framing
@@ -16,8 +18,16 @@ func writePkt(buf *bytes.Buffer, payload string) {
 	writePktBytes(buf, []byte(payload))
 }
 
+const hexDigits = "0123456789abcdef"
+
+// writePktBytes frames one pkt-line. Lengths above 0xffff are not used: sideband chunks cap the
+// largest payload below that.
 func writePktBytes(buf *bytes.Buffer, payload []byte) {
-	fmt.Fprintf(buf, "%04x", len(payload)+4)
+	n := uint(len(payload) + 4)
+	buf.WriteByte(hexDigits[(n>>12)&0xf])
+	buf.WriteByte(hexDigits[(n>>8)&0xf])
+	buf.WriteByte(hexDigits[(n>>4)&0xf])
+	buf.WriteByte(hexDigits[n&0xf])
 	buf.Write(payload)
 }
 
@@ -140,6 +150,7 @@ type fetchPack struct {
 	pack      []byte
 	shallow   []string
 	unshallow []string
+	body      []byte
 }
 
 func writeObjHeader(buf *bytes.Buffer, typCode byte, size int64) {
@@ -183,7 +194,7 @@ func packObjects(repo *Repo, set map[string]bool) []*gObj {
 	for oid := range set {
 		oids = append(oids, oid)
 	}
-	sortStrings(oids)
+	sort.Strings(oids)
 	objs := make([]*gObj, 0, len(oids))
 	for _, oid := range oids {
 		if obj := repo.Objects[oid]; obj != nil {
@@ -191,14 +202,6 @@ func packObjects(repo *Repo, set map[string]bool) []*gObj {
 		}
 	}
 	return objs
-}
-
-func sortStrings(values []string) {
-	for i := 1; i < len(values); i++ {
-		for j := i; j > 0 && values[j] < values[j-1]; j-- {
-			values[j], values[j-1] = values[j-1], values[j]
-		}
-	}
 }
 
 // ---------------------------------------------------------------- pack reading
@@ -277,14 +280,11 @@ func readPackDir(data []byte, repo *Repo) ([]*gObj, error) {
 			baseOID = hex.EncodeToString(body[pos : pos+20])
 			pos += 20
 		}
-		inflated, consumed, err := inflateFrom(body[pos:])
+		inflated, consumed, err := inflateFrom(body[pos:], size)
 		if err != nil {
 			return nil, err
 		}
 		pos += consumed
-		if int64(len(inflated)) != size {
-			return nil, fmt.Errorf("object size mismatch: header %d, data %d", size, len(inflated))
-		}
 		entry := &rawPackEntry{offset: start, data: inflated}
 		var typ string
 		switch code {
@@ -337,21 +337,35 @@ func readPackDir(data []byte, repo *Repo) ([]*gObj, error) {
 	return out, nil
 }
 
-// inflateFrom inflates one zlib stream and reports how many input bytes it consumed.
-func inflateFrom(data []byte) ([]byte, int, error) {
+// zlibReaders pools inflate states: every pushed object used to allocate a fresh 32 KiB window.
+var zlibReaders sync.Pool
+
+// inflateFrom inflates one zlib stream of a known size and reports how many input bytes it consumed.
+func inflateFrom(data []byte, size int64) ([]byte, int, error) {
 	r := bytes.NewReader(data)
-	zr, err := zlib.NewReader(r)
+	var zr io.ReadCloser
+	var err error
+	if pooled := zlibReaders.Get(); pooled != nil {
+		zr = pooled.(io.ReadCloser)
+		err = zr.(zlib.Resetter).Reset(r, nil)
+	} else {
+		zr, err = zlib.NewReader(r)
+	}
 	if err != nil {
 		return nil, 0, err
 	}
-	out, err := io.ReadAll(zr)
-	closeErr := zr.Close()
+	out, rerr := io.ReadAll(zr)
+	cerr := zr.Close()
 	consumed := len(data) - r.Len()
-	if err != nil {
-		return nil, consumed, err
+	if rerr != nil {
+		return nil, consumed, rerr
 	}
-	if closeErr != nil {
-		return nil, consumed, closeErr
+	zlibReaders.Put(zr)
+	if cerr != nil {
+		return nil, consumed, cerr
+	}
+	if int64(len(out)) != size {
+		return nil, consumed, fmt.Errorf("object size mismatch: header %d, data %d", size, len(out))
 	}
 	return out, consumed, nil
 }

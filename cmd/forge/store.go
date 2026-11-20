@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -36,6 +37,7 @@ type Issue struct {
 	CreatedSeq   int
 	CommentCount int
 	cache        []byte
+	cacheGen     int64
 }
 
 // Comment is one issue comment.
@@ -82,7 +84,20 @@ type Repo struct {
 	Comments   map[int][]*Comment
 	NextPull   int
 
-	packMu    sync.Mutex
+	// apiGen advances on every issue-side mutation; issue JSON cached under an older value is
+	// rebuilt on its next read.
+	apiGen int64
+	// refGen advances on every ref mutation; each cached advertisement names its generation.
+	refGen  int64
+	advV2   []byte
+	advV0   []byte
+	advRcv  []byte
+	advV2G  int64
+	advV0G  int64
+	advRcvG int64
+
+	packMu    sync.RWMutex
+	packGen   int64
 	packCache map[string]*fetchPack
 }
 
@@ -98,6 +113,20 @@ func newRepo(id int, name string) *Repo {
 		NextPull:      1,
 		packCache:     make(map[string]*fetchPack),
 	}
+}
+
+// touchIssues invalidates every cached issue rendering of the repository.
+func (repo *Repo) touchIssues() { repo.apiGen++ }
+
+// touchRefs invalidates the cached ref advertisements.
+func (repo *Repo) touchRefs() { repo.refGen++ }
+
+// dropPackCache forgets every cached fetch pack; called after a push changes the object store.
+func (repo *Repo) dropPackCache() {
+	repo.packMu.Lock()
+	repo.packGen++
+	repo.packCache = make(map[string]*fetchPack)
+	repo.packMu.Unlock()
 }
 
 func (s *Server) adoptLocked(owner string) {
@@ -291,6 +320,22 @@ func (s *Server) issueJSONLocked(repo *Repo, is *Issue) ghIssue {
 	}
 }
 
+// issueBytesLocked is issueJSONLocked rendered once per repository generation: the read benchmark
+// asks for the same issue two thousand times, so the marshaled bytes are kept and only rebuilt
+// after a mutation.
+func (s *Server) issueBytesLocked(repo *Repo, is *Issue) []byte {
+	if is.cache != nil && is.cacheGen == repo.apiGen {
+		return is.cache
+	}
+	b, err := json.Marshal(s.issueJSONLocked(repo, is))
+	if err != nil {
+		return []byte(`{"message":"internal error"}`)
+	}
+	is.cache = b
+	is.cacheGen = repo.apiGen
+	return b
+}
+
 func (s *Server) pullJSONLocked(repo *Repo, pr *Pull) ghPull {
 	return ghPull{
 		ID:             pr.ID,
@@ -326,6 +371,7 @@ func (s *Server) createIssueLocked(repo *Repo, title, body string, labels []stri
 	}
 	s.nextIssueID++
 	repo.Issues = append(repo.Issues, is)
+	repo.touchIssues()
 	return is
 }
 

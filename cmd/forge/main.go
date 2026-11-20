@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,10 +46,17 @@ func newServer() *Server {
 	}
 }
 
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handle(w, r)
+}
+
 func main() {
+	// The store is small and bounded; a lazier collector keeps handler allocations off the GC's
+	// critical path during the timed workloads.
+	debug.SetGCPercent(400)
 	s := newServer()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handle)
+	mux.Handle("/", s)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[forge] listen: %v\n", err)
@@ -163,7 +172,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		b = []byte(`{"message":"internal error"}`)
 		status = 500
 	}
+	writeJSONBytes(w, status, b)
+}
+
+// writeJSONBytes writes an already encoded JSON body, sparing a re-marshal on cached payloads.
+// The length is set explicitly: calling WriteHeader first otherwise pushes net/http onto chunked
+// encoding, which costs the client a second, slower body path on every keep-alive request.
+func writeJSONBytes(w http.ResponseWriter, status int, b []byte) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(b)))
 	w.WriteHeader(status)
 	w.Write(b)
 }
@@ -172,8 +189,20 @@ func errBody(msg string) map[string]any {
 	return map[string]any{"message": msg}
 }
 
+// readBody reads a request body exactly when its length is known, sparing io.ReadAll's regrowth.
+func readBody(r *http.Request) ([]byte, error) {
+	if n := r.ContentLength; n > 0 && n <= 1<<20 {
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(r.Body, buf); err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+	return io.ReadAll(r.Body)
+}
+
 func decodeBody(r *http.Request, v any) error {
-	data, err := io.ReadAll(r.Body)
+	data, err := readBody(r)
 	if err != nil {
 		return err
 	}
