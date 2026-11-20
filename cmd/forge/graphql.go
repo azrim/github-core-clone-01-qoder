@@ -586,11 +586,12 @@ func (s *Server) executeGraphQL(request gqlRequestBody) map[string]any {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	root := "Query"
 	if op.kind == "mutation" {
-		// Mutations and queries share the same root type in this schema walk.
+		root = "Mutation"
 	}
 	var errs []gqlErr
-	data := s.gqlRender("Query", nil, op.sel, vars, &errs)
+	data := s.gqlRender(root, nil, op.sel, vars, &errs)
 	body := map[string]any{"data": data}
 	if len(errs) > 0 {
 		body["errors"] = errs
@@ -889,7 +890,7 @@ func (s *Server) gqlField(typ string, obj any, name string, args map[string]any)
 			}
 			return gqlObj{"Issue", &issueNode{repo, is}}, nil
 		case "issues":
-			return s.gqlIssuesConnection(repo, args), nil
+			return gqlObj{"IssueConnection", s.gqlIssuesConnection(repo, args)}, nil
 		case "pullRequest":
 			pr := repo.pullByNumberLocked(intFromAny(args["number"], 0))
 			if pr == nil {
@@ -1003,11 +1004,21 @@ func (s *Server) gqlField(typ string, obj any, name string, args map[string]any)
 			if len(paths) > first {
 				paths = paths[:first]
 			}
+			return gqlObj{"PullRequestChangedFileConnection", paths}, nil
+		}
+		return nil, fmt.Errorf("Cannot query field %q on type %q.", name, typ)
+
+	case "PullRequestChangedFileConnection":
+		paths, _ := obj.([]string)
+		switch name {
+		case "nodes":
 			items := make([]any, 0, len(paths))
 			for _, path := range paths {
 				items = append(items, path)
 			}
 			return gqlList{"PullRequestChangedFile", items}, nil
+		case "totalCount":
+			return len(paths), nil
 		}
 		return nil, fmt.Errorf("Cannot query field %q on type %q.", name, typ)
 
