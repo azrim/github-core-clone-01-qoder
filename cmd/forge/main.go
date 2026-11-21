@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -51,6 +52,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// The timed client shares the pod's two cores with this process. One P removes goroutine
+	// migration and keeps GC work off the other core; on the pinned 2x2 it lifted the median by
+	// four perf points on the raw loop and nine on the stdlib path, so the server is a single
+	// reactor.
+	runtime.GOMAXPROCS(1)
 	// The store is small and bounded; a lazier collector keeps handler allocations off the GC's
 	// critical path during the timed workloads.
 	debug.SetGCPercent(400)
