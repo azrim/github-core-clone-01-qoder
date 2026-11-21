@@ -62,12 +62,21 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[forge] listen: %v\n", err)
 		os.Exit(1)
 	}
+	// Default: the hand-written keep-alive loop in rawhttp.go. FORGE_HTTP=nethttp keeps the
+	// stdlib server for the A/B runs; both paths call the same handlers with the same store.
 	srv := &http.Server{Handler: mux}
-	go func() {
-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "[forge] serve: %v\n", err)
-		}
-	}()
+	stopServe := func() {}
+	if os.Getenv("FORGE_HTTP") == "nethttp" {
+		go func() {
+			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+				fmt.Fprintf(os.Stderr, "[forge] serve: %v\n", err)
+			}
+		}()
+		stopServe = func() { srv.Close() }
+	} else {
+		go s.serveRaw(ln)
+		stopServe = func() { ln.Close() }
+	}
 
 	envURL := strings.TrimRight(os.Getenv("MAKEFUN_ENV_URL"), "/")
 	if envURL == "" {
@@ -80,7 +89,7 @@ func main() {
 		os.Exit(1)
 	}
 	waitDone(envURL)
-	srv.Close()
+	stopServe()
 	os.Exit(0)
 }
 
