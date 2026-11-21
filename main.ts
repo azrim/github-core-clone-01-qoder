@@ -21,6 +21,16 @@ const binary = join(import.meta.dirname, process.platform === 'win32' ? 'forge.e
 
 const child = spawn(binary, [], { stdio: 'inherit', env: process.env });
 
+// Forward termination from the launcher (the env's shutdown or an aborted trial) to the child, so
+// the forge binary never outlives the entrypoint with the trial port still bound.
+let forwarded: NodeJS.Signals | null = null;
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(sig, () => {
+    forwarded = sig;
+    if (child.exitCode === null && child.signalCode === null) child.kill(sig);
+  });
+}
+
 child.on('error', (err: Error) => {
   process.stderr.write(`[entry] could not start ${binary}: ${err.message}\n`);
   process.exit(1);
@@ -28,7 +38,8 @@ child.on('error', (err: Error) => {
 
 child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
   if (signal !== null) {
-    process.stderr.write(`[entry] ${binary} was killed by ${signal}\n`);
+    const via = forwarded === signal ? ' (forwarded from the launcher)' : '';
+    process.stderr.write(`[entry] ${binary} was killed by ${signal}${via}\n`);
     process.exit(1);
   }
   process.exit(code ?? 1);
